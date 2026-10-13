@@ -43,6 +43,14 @@ enum LAMBERT_SOLVER_SUCCESS {
 	LAMBERT_FAIL_ECC         /**< Invalid eccentricity */
 };
 
+enum LambertSolverMethod {
+	LAMBERT_METHOD_LEGACY,
+	LAMBERT_METHOD_IZZO
+};
+
+void set_lambert_solver_method(enum LambertSolverMethod method);
+enum LambertSolverMethod get_lambert_solver_method();
+
 /**
  * @brief Lambert solution for 2D orbits including true anomalies and success status
  */
@@ -61,6 +69,27 @@ typedef struct Lambert3 {
 	Vector3 r1, v1;                     /**< Final position and velocity vectors */
 	enum LAMBERT_SOLVER_SUCCESS success; /**< Status of Lambert solver */
 } Lambert3;
+
+typedef struct PoweredFlybyResult {
+	double periapsis_radius;
+	double burn_delta_v;
+	Vector3 burn_delta_v_vector;
+	Vector3 periapsis_direction;
+	Vector3 incoming_tangent_direction;
+	Vector3 outgoing_tangent_direction;
+	double soi_radius;
+	double incoming_soi_time;
+	double outgoing_soi_time;
+	OSV incoming_soi_state;
+	OSV outgoing_soi_state;
+} PoweredFlybyResult;
+
+typedef struct DepartureBurn3D {
+	Vector3 burn_delta_v;
+	Vector3 periapsis_direction;
+	Vector3 tangential_direction;
+	double burn_magnitude;
+} DepartureBurn3D;
 
 /**
  * @brief Enumeration of hyperbolic transfer orbit types
@@ -128,6 +157,8 @@ double dv_circ(struct Body *body, double rp, double vinf);
  * @return Delta-v required for capture [m/s]
  */
 double dv_capture(struct Body *body, double rp, double vinf);
+int calculate_free_plane_departure_burn(Vector3 v_inf, Body *body, double periapsis_radius,
+		DepartureBurn3D *result);
 
 
 /*
@@ -168,6 +199,18 @@ Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, 
  * @return Lambert3 struct containing position, velocity vectors and solver status
  */
 Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
+Lambert3 calc_lambert3_selected(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
+
+/**
+ * @brief Computes a zero-revolution Lambert solution using Izzo's formulation
+ *
+ * @param r0 Initial position vector [m]
+ * @param r1 Final position vector [m]
+ * @param target_dt Desired transfer time [s]
+ * @param cb Pointer to the central body
+ * @return Lambert3 containing the endpoint velocities and solver status
+ */
+Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
 
 
 /*
@@ -187,6 +230,8 @@ Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
  * @return Periapsis radius of the flyby hyperbola [m]
  */
 double get_flyby_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *body);
+int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *body,
+		double minimum_periapsis_radius, PoweredFlybyResult *result);
 
 /**
  * @brief Calculates inclination angle of a flyby based on incoming, outgoing, and central body velocity vectors,
