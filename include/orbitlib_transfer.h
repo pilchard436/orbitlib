@@ -70,6 +70,8 @@ typedef struct Lambert3 {
 	enum LAMBERT_SOLVER_SUCCESS success; /**< Status of Lambert solver */
 } Lambert3;
 
+typedef int (*LambertCancelCheck)(void *context);
+
 typedef struct PoweredFlybyResult {
 	double periapsis_radius;
 	double burn_delta_v;
@@ -200,6 +202,8 @@ Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, 
  */
 Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
 Lambert3 calc_lambert3_selected(Vector3 r0, Vector3 r1, double target_dt, Body *cb);
+Lambert3 calc_lambert3_selected_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		LambertCancelCheck cancel_check, void *cancel_context);
 
 /**
  * @brief Computes a zero-revolution Lambert solution using Izzo's formulation

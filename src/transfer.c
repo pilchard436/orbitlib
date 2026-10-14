@@ -196,7 +196,8 @@ double departure_true_anomaly_at_max_dt(double r0, double r1, double delta_ta) {
 	return pi_norm(min_arr_ta);
 }
 
-Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, Body *cb) {
+static Lambert2 calc_lambert2_cancellable(double r0, double r1, double delta_ta,
+		double target_dt, Body *cb, LambertCancelCheck cancel_check, void *cancel_context) {
 	// 0°, 180° and 360° are extreme edge cases with funky stuff happening with floating point imprecision -> adjust delta in true anomaly
 	if(fabs(delta_ta) < 0.001 ||
 	   fabs(delta_ta-M_PI) < 0.001) delta_ta += 0.001;
@@ -222,6 +223,8 @@ Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, 
 	enum LAMBERT_SOLVER_SUCCESS success = LAMBERT_MAX_ITERATIONS;
 	
 	for(int i = 0; i < LAMBERT_MAX_ITERATIONS; i++) {
+		if(cancel_check != NULL && cancel_check(cancel_context))
+			return (Lambert2){.success = LAMBERT_FAIL_NAN};
 		ta0_pun = next_lambert_root_x(samples, sample_count);
 		if(i > 3 && last_ta0_pun == ta0_pun) { success = LAMBERT_IMPRECISION; break;}	// increments are 0 (due to imprecision)
 		
@@ -296,12 +299,22 @@ Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, 
 	return solution;
 }
 
-Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+Lambert2 calc_lambert2(double r0, double r1, double delta_ta, double target_dt, Body *cb) {
+	return calc_lambert2_cancellable(r0, r1, delta_ta, target_dt, cb, NULL, NULL);
+}
+
+static Lambert3 calc_lambert3_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		LambertCancelCheck cancel_check, void *cancel_context) {
+	if(cancel_check != NULL && cancel_check(cancel_context))
+		return (Lambert3){.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
 	double r0_mag = mag_vec3(r0);
 	double r1_mag = mag_vec3(r1);
 	double delta_ta = angle_vec3_vec3(r0, r1);
 	if (cross_vec3(r0, r1).z < 0) delta_ta = 2 * M_PI - delta_ta;
-	Lambert2 solution2d = calc_lambert2(r0_mag, r1_mag, delta_ta, target_dt, cb);
+	Lambert2 solution2d = calc_lambert2_cancellable(r0_mag, r1_mag, delta_ta, target_dt, cb,
+		cancel_check, cancel_context);
+	if(cancel_check != NULL && cancel_check(cancel_context))
+		return (Lambert3){.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
 	
 	if(solution2d.success == LAMBERT_FAIL_ECC) {
 		return (Lambert3) {.success = solution2d.success};
@@ -347,6 +360,10 @@ Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
 	Vector3 v1 = heliocentric_rot(v1_2d, raan, arg_peri, i);
 	
 	return (Lambert3) {r0, v0, r1, v1, solution2d.success};
+}
+
+Lambert3 calc_lambert3(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+	return calc_lambert3_cancellable(r0, r1, target_dt, cb, NULL, NULL);
 }
 
 static double izzo_hypergeometric(double z) {
@@ -410,14 +427,18 @@ static int izzo_time_of_flight_derivatives(double x, double lambda, double time_
 	return isfinite(*first) && isfinite(*second) && isfinite(*third) && fabs(*first) > DBL_MIN;
 }
 
-static Lambert3 izzo_legacy_fallback(Vector3 r0, Vector3 r1, double target_dt, Body *cb, Lambert3 failure) {
-	Lambert3 legacy = calc_lambert3(r0, r1, target_dt, cb);
+static Lambert3 izzo_legacy_fallback(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		Lambert3 failure, LambertCancelCheck cancel_check, void *cancel_context) {
+	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
+	Lambert3 legacy = calc_lambert3_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
 	if(legacy.success == LAMBERT_FAIL_NAN || legacy.success == LAMBERT_FAIL_ECC) return failure;
 	return legacy;
 }
 
-Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+static Lambert3 calc_lambert3_izzo_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		LambertCancelCheck cancel_check, void *cancel_context) {
 	Lambert3 failure = {.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
+	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
 	if(cb == NULL || !(cb->mu > 0) || !(target_dt > 0) || !isfinite(target_dt)) return failure;
 	double r0_magnitude = mag_vec3(r0);
 	double r1_magnitude = mag_vec3(r1);
@@ -464,28 +485,30 @@ Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb) 
 
 	int converged = 0;
 	for(int iteration = 0; iteration < 15; iteration++) {
+		if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
 		double computed_time = izzo_time_of_flight(x, lambda);
 		double delta = computed_time - dimensionless_time;
-			if(!isfinite(delta)) return izzo_legacy_fallback(r0, r1, target_dt, cb, failure);
+			if(!isfinite(delta)) return izzo_legacy_fallback(r0, r1, target_dt, cb, failure,
+				cancel_check, cancel_context);
 		if(fabs(delta) <= IZZO_TIME_OF_FLIGHT_TOLERANCE * fmax(1, dimensionless_time)) {
 			converged = 1;
 			break;
 		}
 		double first, second, third;
 		if(!izzo_time_of_flight_derivatives(x, lambda, computed_time, &first, &second, &third))
-			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure);
+			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure, cancel_check, cancel_context);
 		double first2 = first * first;
 		double denominator = first * (first2 - delta * second) + third * delta * delta / 6;
 		if(!isfinite(denominator) || fabs(denominator) < DBL_MIN)
-			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure);
+			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure, cancel_check, cancel_context);
 		double next_x = x - delta * (first2 - delta * second / 2) / denominator;
 		if(!isfinite(next_x) || next_x <= -1)
-			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure);
+			return izzo_legacy_fallback(r0, r1, target_dt, cb, failure, cancel_check, cancel_context);
 		x = next_x;
 	}
 	if(!converged) {
 		Lambert3 not_converged = {.r0 = r0, .r1 = r1, .success = LAMBERT_MAX_ITERATIONS};
-		return izzo_legacy_fallback(r0, r1, target_dt, cb, not_converged);
+		return izzo_legacy_fallback(r0, r1, target_dt, cb, not_converged, cancel_check, cancel_context);
 	}
 
 	double y = sqrt(1 - lambda2 * (1 - x * x));
@@ -501,14 +524,24 @@ Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb) 
 		scale_vec3(tangent1, transverse_velocity / r1_magnitude));
 	if(!isfinite(v0.x) || !isfinite(v0.y) || !isfinite(v0.z) ||
 		!isfinite(v1.x) || !isfinite(v1.y) || !isfinite(v1.z))
-		return izzo_legacy_fallback(r0, r1, target_dt, cb, failure);
+		return izzo_legacy_fallback(r0, r1, target_dt, cb, failure, cancel_check, cancel_context);
+	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
 	return (Lambert3){r0, v0, r1, v1, LAMBERT_SUCCESS};
 }
 
-Lambert3 calc_lambert3_selected(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+	return calc_lambert3_izzo_cancellable(r0, r1, target_dt, cb, NULL, NULL);
+}
+
+Lambert3 calc_lambert3_selected_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		LambertCancelCheck cancel_check, void *cancel_context) {
 	if(get_lambert_solver_method() == LAMBERT_METHOD_LEGACY)
-		return calc_lambert3(r0, r1, target_dt, cb);
-	return calc_lambert3_izzo(r0, r1, target_dt, cb);
+		return calc_lambert3_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
+	return calc_lambert3_izzo_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
+}
+
+Lambert3 calc_lambert3_selected(Vector3 r0, Vector3 r1, double target_dt, Body *cb) {
+	return calc_lambert3_selected_cancellable(r0, r1, target_dt, cb, NULL, NULL);
 }
 
 
