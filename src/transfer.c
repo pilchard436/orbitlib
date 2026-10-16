@@ -533,6 +533,140 @@ Lambert3 calc_lambert3_izzo(Vector3 r0, Vector3 r1, double target_dt, Body *cb) 
 	return calc_lambert3_izzo_cancellable(r0, r1, target_dt, cb, NULL, NULL);
 }
 
+// Elliptic time of flight with whole revolutions, x in (-1, 1).
+static double izzo_time_of_flight_revs(double x, double lambda, int revolutions) {
+	double one_minus_x2 = 1 - x * x;
+	double y = sqrt(1 - lambda * lambda * one_minus_x2);
+	double angle = acos(fmax(-1.0, fmin(1.0, x * y + lambda * one_minus_x2)));
+	return ((angle + revolutions * M_PI) / sqrt(one_minus_x2) - x + lambda * y) / one_minus_x2;
+}
+
+static int izzo_revs_derivatives(double x, double lambda, double time_of_flight,
+		double *first, double *second, double *third) {
+	double one_minus_x2 = 1 - x * x;
+	if(fabs(one_minus_x2) < 1e-5) return 0;
+	double lambda2 = lambda * lambda;
+	double lambda3 = lambda2 * lambda;
+	double y = sqrt(1 - lambda2 * one_minus_x2);
+	double y2 = y * y;
+	double y3 = y2 * y;
+	*first = (3 * time_of_flight * x - 2 + 2 * lambda3 * x / y) / one_minus_x2;
+	*second = (3 * time_of_flight + 5 * x * *first + 2 * (1 - lambda2) * lambda3 / y3) / one_minus_x2;
+	*third = (7 * x * *second + 8 * *first -
+		6 * (1 - lambda2) * lambda2 * lambda3 * x / (y3 * y2)) / one_minus_x2;
+	return isfinite(*first) && isfinite(*second) && isfinite(*third);
+}
+
+// The fastest transfer with this many revolutions sits at the minimum of the time of flight.
+static int izzo_minimum_time(double lambda, int revolutions, double *x_minimum, double *time_minimum) {
+	double x = 0;
+	for(int iteration = 0; iteration < 60; iteration++) {
+		double time = izzo_time_of_flight_revs(x, lambda, revolutions);
+		double first, second, third;
+		if(!izzo_revs_derivatives(x, lambda, time, &first, &second, &third)) return 0;
+		double denominator = 2 * second * second - first * third;
+		if(!isfinite(denominator) || fabs(denominator) < DBL_MIN) return 0;
+		double next = fmax(-0.999, fmin(0.999, x - 2 * first * second / denominator));
+		if(!isfinite(next)) return 0;
+		if(fabs(next - x) < 1e-13) { x = next; break; }
+		x = next;
+	}
+	*x_minimum = x;
+	*time_minimum = izzo_time_of_flight_revs(x, lambda, revolutions);
+	return isfinite(*time_minimum);
+}
+
+Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		int revolutions, int right_branch, LambertCancelCheck cancel_check, void *cancel_context) {
+	if(revolutions <= 0)
+		return calc_lambert3_selected_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
+	Lambert3 failure = {.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
+	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
+	if(cb == NULL || !(cb->mu > 0) || !(target_dt > 0) || !isfinite(target_dt)) return failure;
+	double r0_magnitude = mag_vec3(r0);
+	double r1_magnitude = mag_vec3(r1);
+	if(!(r0_magnitude > 0) || !(r1_magnitude > 0)) return failure;
+
+	Vector3 direction = cross_vec3(r0, r1);
+	double direction_magnitude = mag_vec3(direction);
+	if(!(direction_magnitude > 0) || !isfinite(direction_magnitude)) return failure;
+	direction = scale_vec3(direction, 1 / direction_magnitude);
+
+	Vector3 radial0 = scale_vec3(r0, 1 / r0_magnitude);
+	Vector3 radial1 = scale_vec3(r1, 1 / r1_magnitude);
+	Vector3 tangent0 = cross_vec3(direction, radial0);
+	Vector3 tangent1 = cross_vec3(direction, radial1);
+	double chord = mag_vec3(subtract_vec3(r1, r0));
+	if(!(chord > 0)) return failure;
+	double semiperimeter = (r0_magnitude + r1_magnitude + chord) / 2;
+	double lambda_magnitude = sqrt(fmax(0, 1 - chord / semiperimeter));
+	double lambda = direction.z < 0 ? -lambda_magnitude : lambda_magnitude;
+	if(direction.z < 0) {
+		tangent0 = scale_vec3(tangent0, -1);
+		tangent1 = scale_vec3(tangent1, -1);
+	}
+	double lambda2 = lambda * lambda;
+	double dimensionless_time = sqrt(2 * cb->mu / (semiperimeter * semiperimeter * semiperimeter)) * target_dt;
+	if(!(dimensionless_time > 0) || !isfinite(dimensionless_time)) return failure;
+
+	double x_minimum, time_minimum;
+	if(!izzo_minimum_time(lambda, revolutions, &x_minimum, &time_minimum) ||
+		dimensionless_time < time_minimum) return failure;
+	double x;
+	if(!right_branch) {
+		double a = pow((revolutions * M_PI + M_PI) / (8 * dimensionless_time), 2.0 / 3.0);
+		x = (a - 1) / (a + 1);
+	} else {
+		double b = pow(8 * dimensionless_time / (revolutions * M_PI), 2.0 / 3.0);
+		x = (b - 1) / (b + 1);
+	}
+	x = fmax(-0.999, fmin(0.999, x));
+
+	int converged = 0;
+	for(int iteration = 0; iteration < 60; iteration++) {
+		if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
+		double computed_time = izzo_time_of_flight_revs(x, lambda, revolutions);
+		double delta = computed_time - dimensionless_time;
+		if(!isfinite(delta)) return failure;
+		if(fabs(delta) <= 1e-11 * fmax(1, dimensionless_time)) {
+			converged = 1;
+			break;
+		}
+		double first, second, third;
+		if(!izzo_revs_derivatives(x, lambda, computed_time, &first, &second, &third)) return failure;
+		double first2 = first * first;
+		double denominator = first * (first2 - delta * second) + third * delta * delta / 6;
+		if(!isfinite(denominator) || fabs(denominator) < DBL_MIN) return failure;
+		double next_x = x - delta * (first2 - delta * second / 2) / denominator;
+		if(!isfinite(next_x)) return failure;
+		if(next_x <= -0.9999) next_x = (x - 1) / 2;
+		if(next_x >= 0.9999) next_x = (x + 1) / 2;
+		x = next_x;
+	}
+	if(!converged) return failure;
+	if((!right_branch && x > x_minimum + 1e-9) || (right_branch && x < x_minimum - 1e-9)) return failure;
+
+	double y = sqrt(1 - lambda2 * (1 - x * x));
+	double rho = (r0_magnitude - r1_magnitude) / chord;
+	double sigma = sqrt(fmax(0, 1 - rho * rho));
+	double gamma = sqrt(cb->mu * semiperimeter / 2);
+	double radial_velocity0 = gamma * ((lambda * y - x) - rho * (lambda * y + x)) / r0_magnitude;
+	double radial_velocity1 = -gamma * ((lambda * y - x) + rho * (lambda * y + x)) / r1_magnitude;
+	double transverse_velocity = gamma * sigma * (y + lambda * x);
+	Vector3 v0 = add_vec3(scale_vec3(radial0, radial_velocity0),
+		scale_vec3(tangent0, transverse_velocity / r0_magnitude));
+	Vector3 v1 = add_vec3(scale_vec3(radial1, radial_velocity1),
+		scale_vec3(tangent1, transverse_velocity / r1_magnitude));
+	if(!isfinite(v0.x) || !isfinite(v0.y) || !isfinite(v0.z) ||
+		!isfinite(v1.x) || !isfinite(v1.y) || !isfinite(v1.z)) return failure;
+	return (Lambert3){r0, v0, r1, v1, LAMBERT_SUCCESS};
+}
+
+Lambert3 calc_lambert3_revs(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		int revolutions, int right_branch) {
+	return calc_lambert3_revs_cancellable(r0, r1, target_dt, cb, revolutions, right_branch, NULL, NULL);
+}
+
 Lambert3 calc_lambert3_selected_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
 		LambertCancelCheck cancel_check, void *cancel_context) {
 	if(get_lambert_solver_method() == LAMBERT_METHOD_LEGACY)

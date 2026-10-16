@@ -206,6 +206,18 @@ Lambert3 calc_lambert3_selected_cancellable(Vector3 r0, Vector3 r1, double targe
 		LambertCancelCheck cancel_check, void *cancel_context);
 
 /**
+ * @brief Lambert solution with whole revolutions around the central body (Izzo)
+ *
+ * With revolutions == 0 this is the selected zero-revolution solver. With revolutions > 0 there are two
+ * solutions (right_branch 0 or 1) once the transfer time exceeds the minimum for that many revolutions;
+ * a solution that does not exist is reported as LAMBERT_FAIL_NAN.
+ */
+Lambert3 calc_lambert3_revs(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		int revolutions, int right_branch);
+Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		int revolutions, int right_branch, LambertCancelCheck cancel_check, void *cancel_context);
+
+/**
  * @brief Computes a zero-revolution Lambert solution using Izzo's formulation
  *
  * @param r0 Initial position vector [m]
