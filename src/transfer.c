@@ -673,20 +673,43 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	if(!(maximum_periapsis > minimum_periapsis_radius)) return 0;
 
 	int found_solution = 0;
-	int best_sample = -1;
 	const int sample_count = 64;
+	double log_minimum = log(minimum_periapsis_radius);
+	double log_range = log(maximum_periapsis / minimum_periapsis_radius);
+	double lower = 0, upper = 0;
 	PoweredFlybyResult best = {.burn_delta_v = DBL_MAX};
 	for(int sample = 0; sample < sample_count; sample++) {
-		double fraction = (double)sample / (sample_count - 1);
-		double periapsis_radius = minimum_periapsis_radius *
-			pow(maximum_periapsis / minimum_periapsis_radius, fraction);
+		double periapsis_radius = exp(log_minimum + log_range * sample / (sample_count - 1));
 		PoweredFlybyResult candidate;
 		if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, periapsis_radius, &candidate)) {
-			if(candidate.burn_delta_v < best.burn_delta_v) {
-				best = candidate;
-				best_sample = sample;
+			body->mu, periapsis_radius, &candidate) && candidate.burn_delta_v < best.burn_delta_v) {
+			best = candidate;
+			lower = log_minimum + log_range * fmax(0, sample - 1) / (sample_count - 1);
+			upper = log_minimum + log_range * fmin(sample_count - 1, sample + 1) / (sample_count - 1);
+			found_solution = 1;
+		}
+	}
+	// The coarse grid can miss a narrow feasible window near the turn-matching periapsis.
+	double local_lower = 0, local_upper = 0, local_best_burn = DBL_MAX;
+	int local_found = 0;
+	double turn_periapsis = get_flyby_periapsis(v_arr, v_dep, v_body, body);
+	if(isfinite(turn_periapsis) && turn_periapsis > 0) {
+		const int local_count = 49;
+		double local_span = log(2.0);
+		for(int sample = 0; sample < local_count; sample++) {
+			double log_radius = log(turn_periapsis) + local_span * (2.0 * sample / (local_count - 1) - 1);
+			double periapsis_radius = exp(log_radius);
+			if(periapsis_radius < minimum_periapsis_radius || periapsis_radius > maximum_periapsis) continue;
+			PoweredFlybyResult candidate;
+			if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+				body->mu, periapsis_radius, &candidate) && candidate.burn_delta_v < local_best_burn) {
+				local_best_burn = candidate.burn_delta_v;
+				double step = 2 * local_span / (local_count - 1);
+				local_lower = log_radius - step;
+				local_upper = log_radius + step;
+				if(candidate.burn_delta_v < best.burn_delta_v) best = candidate;
 				found_solution = 1;
+				local_found = 1;
 			}
 		}
 	}
@@ -696,27 +719,30 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 		return 1;
 	}
 
-	double log_minimum = log(minimum_periapsis_radius);
-	double log_range = log(maximum_periapsis / minimum_periapsis_radius);
-	double lower = log_minimum + log_range * fmax(0, best_sample - 1) / (sample_count - 1);
-	double upper = log_minimum + log_range * fmin(sample_count - 1, best_sample + 1) / (sample_count - 1);
-	for(int iteration = 0; iteration < 32; iteration++) {
-		double first_log = lower + (upper - lower) * 0.3819660112501051;
-		double second_log = lower + (upper - lower) * 0.6180339887498949;
-		PoweredFlybyResult first, second;
-		int first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, exp(first_log), &first);
-		int second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, exp(second_log), &second);
-		double first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
-		double second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
-		if(first_cost <= second_cost) upper = second_log;
-		else lower = first_log;
+	for(int bracket = 0; bracket < 2; bracket++) {
+		if(bracket == 1) {
+			if(!local_found) break;
+			lower = fmax(local_lower, log_minimum);
+			upper = fmin(local_upper, log_minimum + log_range);
+		}
+		for(int iteration = 0; iteration < 32; iteration++) {
+			double first_log = lower + (upper - lower) * 0.3819660112501051;
+			double second_log = lower + (upper - lower) * 0.6180339887498949;
+			PoweredFlybyResult first, second;
+			int first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+				body->mu, exp(first_log), &first);
+			int second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+				body->mu, exp(second_log), &second);
+			double first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
+			double second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
+			if(first_cost <= second_cost) upper = second_log;
+			else lower = first_log;
+		}
+		PoweredFlybyResult refined;
+		if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+			body->mu, exp((lower + upper) / 2), &refined) && refined.burn_delta_v < best.burn_delta_v)
+			best = refined;
 	}
-	PoweredFlybyResult refined;
-	if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-		body->mu, exp((lower + upper) / 2), &refined) && refined.burn_delta_v < best.burn_delta_v)
-		best = refined;
 	int best_valid = populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &best);
 	if(shortcut_valid && (!best_valid || shortcut.burn_delta_v <= best.burn_delta_v)) {
 		*result = shortcut;
