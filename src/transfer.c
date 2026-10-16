@@ -648,12 +648,20 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	double incoming_speed = mag_vec3(incoming);
 	double outgoing_speed = mag_vec3(outgoing);
 	if(!(incoming_speed > 0) || !(outgoing_speed > 0)) return 0;
+	PoweredFlybyResult shortcut;
+	int shortcut_valid = 0;
 	if(fabs(incoming_speed - outgoing_speed) < 1) {
+		// Single-periapsis shortcut; it can fail or overstate the burn when the speeds differ slightly,
+		// so it is only returned directly when the burn is negligible.
 		double unpowered_periapsis = get_flyby_periapsis(v_arr, v_dep, v_body, body);
 		if(unpowered_periapsis < minimum_periapsis_radius) return 0;
-		if(!powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, unpowered_periapsis, result)) return 0;
-		return populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, result);
+		shortcut_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+			body->mu, unpowered_periapsis, &shortcut) &&
+			populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &shortcut);
+		if(shortcut_valid && shortcut.burn_delta_v < 2.0) {
+			*result = shortcut;
+			return 1;
+		}
 	}
 
 	double maximum_periapsis = minimum_periapsis_radius * 1e5;
@@ -682,7 +690,11 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 			}
 		}
 	}
-	if(!found_solution) return 0;
+	if(!found_solution) {
+		if(!shortcut_valid) return 0;
+		*result = shortcut;
+		return 1;
+	}
 
 	double log_minimum = log(minimum_periapsis_radius);
 	double log_range = log(maximum_periapsis / minimum_periapsis_radius);
@@ -705,7 +717,12 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
 		body->mu, exp((lower + upper) / 2), &refined) && refined.burn_delta_v < best.burn_delta_v)
 		best = refined;
-	if(!populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &best)) return 0;
+	int best_valid = populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &best);
+	if(shortcut_valid && (!best_valid || shortcut.burn_delta_v <= best.burn_delta_v)) {
+		*result = shortcut;
+		return 1;
+	}
+	if(!best_valid) return 0;
 	*result = best;
 	return 1;
 }
