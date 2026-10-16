@@ -827,7 +827,7 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	double local_lower = 0, local_upper = 0, local_best_burn = DBL_MAX;
 	int local_found = 0;
 	double turn_periapsis = get_flyby_periapsis(v_arr, v_dep, v_body, body);
-	if(isfinite(turn_periapsis) && turn_periapsis > 0) {
+	if(isfinite(turn_periapsis) && turn_periapsis > 0 && best.burn_delta_v > 5.0) {
 		const int local_count = 49;
 		double local_span = log(2.0);
 		for(int sample = 0; sample < local_count; sample++) {
