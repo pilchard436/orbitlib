@@ -209,6 +209,13 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 		double minimum_periapsis_radius, PoweredFlybyResult *result);
 
 /**
+ * @brief Powered flyby at a fixed periapsis radius on one side (-1 or +1) of the plane of the excess velocities.
+ * @return 1 on success with the burn and the sphere-of-influence states filled in
+ */
+int calculate_powered_flyby_at_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *body,
+		double periapsis_radius, int side, PoweredFlybyResult *result);
+
+/**
  * @brief Calculates inclination angle of a flyby based on incoming, outgoing, and central body velocity vectors,
  * all given in the same inertial reference frame
  *

@@ -424,8 +424,9 @@ double get_flyby_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *b
 	return (1 / cos(beta) - 1) * (body->mu / (pow(mag_vec3(v1), 2)));
 }
 
-static int powered_flyby_at_radius(Vector3 incoming, Vector3 outgoing, double incoming_speed,
-		double outgoing_speed, double mu, double periapsis_radius, PoweredFlybyResult *result) {
+// only_side is -1 or +1 to fix the side of the plane of the two excess velocities, 0 for the cheaper one.
+static int powered_flyby_at_radius_side(Vector3 incoming, Vector3 outgoing, double incoming_speed,
+		double outgoing_speed, double mu, double periapsis_radius, int only_side, PoweredFlybyResult *result) {
 	Vector3 incoming_direction = scale_vec3(incoming, 1 / incoming_speed);
 	Vector3 outgoing_direction = scale_vec3(outgoing, 1 / outgoing_speed);
 	double direction_dot = fmax(-1, fmin(1, dot_vec3(incoming_direction, outgoing_direction)));
@@ -450,6 +451,7 @@ static int powered_flyby_at_radius(Vector3 incoming, Vector3 outgoing, double in
 	double outgoing_periapsis_speed = sqrt(outgoing_speed * outgoing_speed + 2 * mu / periapsis_radius);
 	PoweredFlybyResult best = {.periapsis_radius = periapsis_radius, .burn_delta_v = DBL_MAX};
 	for(int side = -1; side <= 1; side += 2) {
+		if(only_side != 0 && side != only_side) continue;
 		Vector3 periapsis_direction = add_vec3(periapsis_planar,
 			scale_vec3(normal, side * normal_component));
 		Vector3 incoming_tangent = norm_vec3(subtract_vec3(incoming_direction,
@@ -471,6 +473,12 @@ static int powered_flyby_at_radius(Vector3 incoming, Vector3 outgoing, double in
 	if(!isfinite(best.burn_delta_v)) return 0;
 	*result = best;
 	return 1;
+}
+
+static int powered_flyby_at_radius(Vector3 incoming, Vector3 outgoing, double incoming_speed,
+		double outgoing_speed, double mu, double periapsis_radius, PoweredFlybyResult *result) {
+	return powered_flyby_at_radius_side(incoming, outgoing, incoming_speed, outgoing_speed, mu,
+		periapsis_radius, 0, result);
 }
 
 static int powered_flyby_soi_state(Body *body, Vector3 periapsis_direction,
@@ -623,6 +631,19 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	if(!best_valid) return 0;
 	*result = best;
 	return 1;
+}
+
+int calculate_powered_flyby_at_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *body,
+		double periapsis_radius, int side, PoweredFlybyResult *result) {
+	if(body == NULL || result == NULL || !(body->mu > 0) || !(periapsis_radius > 0) || (side != -1 && side != 1)) return 0;
+	Vector3 incoming = subtract_vec3(v_arr, v_body);
+	Vector3 outgoing = subtract_vec3(v_dep, v_body);
+	double incoming_speed = mag_vec3(incoming);
+	double outgoing_speed = mag_vec3(outgoing);
+	if(!(incoming_speed > 0) || !(outgoing_speed > 0)) return 0;
+	return powered_flyby_at_radius_side(incoming, outgoing, incoming_speed, outgoing_speed,
+		body->mu, periapsis_radius, side, result) &&
+		populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, result);
 }
 
 double get_flyby_inclination(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Plane3 equatorial_plane) {
