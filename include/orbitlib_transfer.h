@@ -56,7 +56,7 @@ typedef int (*LambertCancelCheck)(void *context);
 
 typedef struct PoweredFlybyResult {
 	double periapsis_radius;
-	double burn_delta_v;
+	double burn_delta_v;             /**< Magnitude of burn_delta_v_vector */
 	Vector3 burn_delta_v_vector;
 	Vector3 periapsis_direction;
 	Vector3 incoming_tangent_direction;
