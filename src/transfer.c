@@ -605,18 +605,34 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 			lower = fmax(local_lower, log_minimum);
 			upper = fmin(local_upper, log_minimum + log_range);
 		}
+		double first_log = lower + (upper - lower) * 0.3819660112501051;
+		double second_log = lower + (upper - lower) * 0.6180339887498949;
+		PoweredFlybyResult first, second;
+		int first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+			body->mu, exp(first_log), &first);
+		int second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+			body->mu, exp(second_log), &second);
+		double first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
+		double second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
+		// Golden-section search: each step keeps one interior point, so only one new radius is evaluated.
 		for(int iteration = 0; iteration < 32; iteration++) {
-			double first_log = lower + (upper - lower) * 0.3819660112501051;
-			double second_log = lower + (upper - lower) * 0.6180339887498949;
-			PoweredFlybyResult first, second;
-			int first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-				body->mu, exp(first_log), &first);
-			int second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-				body->mu, exp(second_log), &second);
-			double first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
-			double second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
-			if(first_cost <= second_cost) upper = second_log;
-			else lower = first_log;
+			if(first_cost <= second_cost) {
+				upper = second_log;
+				second_log = first_log;
+				second_cost = first_cost;
+				first_log = lower + (upper - lower) * 0.3819660112501051;
+				first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+					body->mu, exp(first_log), &first);
+				first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
+			} else {
+				lower = first_log;
+				first_log = second_log;
+				first_cost = second_cost;
+				second_log = lower + (upper - lower) * 0.6180339887498949;
+				second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
+					body->mu, exp(second_log), &second);
+				second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
+			}
 		}
 		PoweredFlybyResult refined;
 		if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
