@@ -189,6 +189,39 @@ OSV osv_from_orbit(Orbit orbit) {
 
 OSV osv_from_elements(Orbit orbit, double epoch) {
 	double dt = (epoch - orbit.cb->system->ut0) * (24 * 60 * 60);
+	double e = orbit.e;
+	if(e >= 0 && e < 1 && orbit.a > 0) {
+		// Fast path: stay in eccentric anomaly and skip the true anomaly round trip.
+		double mu = orbit.cb->mu;
+		double n = sqrt(mu / (orbit.a * orbit.a * orbit.a));
+		double sq_p = sqrt(1 + e), sq_m = sqrt(1 - e);
+		double E0 = 2 * atan2(sq_m * sin(orbit.ta / 2), sq_p * cos(orbit.ta / 2));
+		double M = fmod(E0 - e * sin(E0) + n * dt, 2 * M_PI);
+		if(M < 0) M += 2 * M_PI;
+		double E = e < 0.8 ? M : M_PI;
+		int solved = 0;
+		double sinE = 0, cosE = 1;
+		for(int iteration = 0; iteration < 30; iteration++) {
+			sinE = sin(E); cosE = cos(E);
+			double next_E = E - (E - e * sinE - M) / (1 - e * cosE);
+			if(!isfinite(next_E)) break;
+			double change = fabs(next_E - E);
+			E = next_E;
+			if(change < 1e-14) { solved = 1; break; }
+		}
+		if(solved) {
+			sinE = sin(E); cosE = cos(E);
+			double a = orbit.a;
+			double r_mag = a * (1 - e * cosE);
+			double sq_mu_a = sqrt(mu * a) / r_mag;
+			double sq_1e2 = sq_p * sq_m;
+			Vector2 r_2d = {a * (cosE - e), a * sq_1e2 * sinE};
+			Vector2 v_2d = {-sq_mu_a * sinE, sq_mu_a * sq_1e2 * cosE};
+			OSV osv = {heliocentric_rot(r_2d, orbit.raan, orbit.arg_peri, orbit.i),
+					heliocentric_rot(v_2d, orbit.raan, orbit.arg_peri, orbit.i)};
+			return osv;
+		}
+	}
 	orbit = propagate_orbit_time(orbit, dt);
 	return osv_from_orbit(orbit);
 }
