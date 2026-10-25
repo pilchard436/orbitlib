@@ -205,7 +205,27 @@ Orbit propagate_orbit_time(Orbit orbit, double dt) {
 	
 	double n = sqrt(mu / pow(fabs(a),3));
 	
-	double step = deg2rad(5);
+	if(e >= 0 && e < 1 && isfinite(target_t) && isfinite(n)) {
+		double reduced_t = target_t;
+		while(reduced_t > T) reduced_t -= T;
+		while(reduced_t < 0) reduced_t += T;
+		double M = n * reduced_t;
+		double E = e < 0.8 ? M : M_PI;
+		int solved = 0;
+		for(int iteration = 0; iteration < 30; iteration++) {
+			double f = E - e * sin(E) - M;
+			double next_E = E - f / (1 - e * cos(E));
+			if(!isfinite(next_E)) break;
+			double change = fabs(next_E - E);
+			E = next_E;
+			if(change < 1e-14) { solved = 1; break; }
+		}
+		if(solved) {
+			orbit.ta = pi_norm(2 * atan2(sqrt(1 + e) * sin(E / 2), sqrt(1 - e) * cos(E / 2)));
+			return orbit;
+		}
+	}
+		double step = deg2rad(5);
 	// if dt is basically 0, only add step, as this gets subtracted after the loop (not going inside loop)
 	if(e<1) ta += fabs(t-target_t) > 1 ? dt/T * M_PI*2 : step;
 	
