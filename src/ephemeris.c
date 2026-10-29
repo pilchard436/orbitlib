@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <math.h>
 
+static Ephem *closest_ephem_entry(Ephem *ephem, int num_ephems, double epoch);
+
 
 void print_ephem(struct Ephem ephem) {
 	printf("Date: %f  (", ephem.epoch);
@@ -132,18 +134,53 @@ void get_body_ephems(Body *body, Datetime min_date, Datetime max_date, Datetime 
 }
 
 Ephem get_closest_ephem(Ephem *ephem, int num_ephems, double epoch) {
-	for(int i = 0; i < num_ephems; i++) {
-		if(epoch < ephem[i].epoch) {
-			if(i == 0) return ephem[0];
-			if(fabs(ephem[i-1].epoch - epoch) < fabs(ephem[i].epoch-epoch)) return ephem[i-1];
-			else return ephem[i];
-		}
+	return *closest_ephem_entry(ephem, num_ephems, epoch);
+}
+
+// The entry whose epoch is nearest; the list is sorted ascending by epoch.
+static Ephem *closest_ephem_entry(Ephem *ephem, int num_ephems, double epoch) {
+	int low = 0, high = num_ephems;	// first index with ephem[index].epoch > epoch
+	while(low < high) {
+		int middle = low + (high - low) / 2;
+		if(epoch < ephem[middle].epoch) high = middle;
+		else low = middle + 1;
 	}
-	return ephem[num_ephems-1];
+	if(low == num_ephems) return &ephem[num_ephems - 1];
+	if(low == 0) return &ephem[0];
+	return fabs(ephem[low - 1].epoch - epoch) < fabs(ephem[low].epoch - epoch) ? &ephem[low - 1] : &ephem[low];
+}
+
+// Elements of recently used ephemeris entries, so repeated propagation from the same entry
+// skips the state-to-elements conversion. Keyed by entry address and contents; per thread.
+#define EPHEM_ELEMENT_CACHE_SIZE 16
+typedef struct EphemElementCache {
+	const Ephem *entry;
+	Ephem contents;
+	struct Body *cb;
+	Orbit orbit;
+} EphemElementCache;
+
+static _Thread_local EphemElementCache ephem_element_cache[EPHEM_ELEMENT_CACHE_SIZE];
+static _Thread_local int ephem_element_cache_next;
+
+static int same_ephem(const Ephem *a, const Ephem *b) {
+	return a->epoch == b->epoch && a->r.x == b->r.x && a->r.y == b->r.y && a->r.z == b->r.z &&
+		a->v.x == b->v.x && a->v.y == b->v.y && a->v.z == b->v.z;
 }
 
 OSV osv_from_ephem(Ephem *ephem_list, int num_ephems, double epoch, struct Body *cb) {
-	Ephem ephem = get_closest_ephem(ephem_list, num_ephems, epoch);
-	double dt = (epoch - ephem.epoch) * (24 * 60 * 60);
-	return propagate_osv_time((OSV){ephem.r, ephem.v}, cb, dt);
+	const Ephem *entry = closest_ephem_entry(ephem_list, num_ephems, epoch);
+	double dt = (epoch - entry->epoch) * (24 * 60 * 60);
+	for(int k = 0; k < EPHEM_ELEMENT_CACHE_SIZE; k++) {
+		if(ephem_element_cache[k].entry == entry && ephem_element_cache[k].cb == cb &&
+			same_ephem(&ephem_element_cache[k].contents, entry))
+			return osv_from_elements_after(&ephem_element_cache[k].orbit, dt);
+	}
+	EphemElementCache *cache = &ephem_element_cache[ephem_element_cache_next];
+	ephem_element_cache_next = (ephem_element_cache_next + 1) % EPHEM_ELEMENT_CACHE_SIZE;
+	cache->entry = entry;
+	cache->contents = *entry;
+	cache->cb = cb;
+	cache->orbit = constr_orbit_from_osv(entry->r, entry->v, cb);
+	return osv_from_elements_after(&cache->orbit, dt);
 }

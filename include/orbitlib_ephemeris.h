@@ -31,6 +31,13 @@ void print_ephem(struct Ephem ephem);
 void get_body_ephems(Body *body, Datetime min_date, Datetime max_date, Datetime time_step, const char *ephem_directory);
 
 /**
+ * @brief Returns the ephemeris entry whose epoch is nearest to the given epoch
+ *
+ * The list must be sorted ascending by epoch. Ties go to the later entry.
+ */
+Ephem get_closest_ephem(Ephem *ephem_list, int num_ephems, double epoch);
+
+/**
  * @brief Interpolates an ephemeris list to get the state vector at a given epoch
  *
  * Uses the provided list of ephemeris entries to compute the OSV (position and velocity)

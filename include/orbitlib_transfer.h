@@ -186,6 +186,15 @@ Lambert3 calc_lambert3_revs(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
 Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
 		int revolutions, int right_branch, LambertCancelCheck cancel_check, void *cancel_context);
 
+/**
+ * @brief Solves both branches of a multi-revolution Lambert problem, sharing the geometry and minimum-time search
+ *
+ * Each branch equals the corresponding calc_lambert3_revs_cancellable result. With zero revolutions only
+ * left_branch is solved and right_branch is a failure.
+ */
+void calc_lambert3_revs_pair_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb, int revolutions,
+		Lambert3 *left_branch, Lambert3 *right_branch, LambertCancelCheck cancel_check, void *cancel_context);
+
 
 
 /*

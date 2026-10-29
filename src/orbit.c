@@ -1,7 +1,21 @@
+#if defined(__GNUC__) && !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "orbitlib_orbit.h"
 #include "orbitlib_celestial.h"
 #include <math.h>
 #include <stdio.h>
+
+static inline void orbit_sincos(double x, double *s, double *c) {
+#if defined(__APPLE__)
+	__sincos(x, s, c);
+#elif defined(__GNUC__)
+	sincos(x, s, c);
+#else
+	*s = sin(x);
+	*c = cos(x);
+#endif
+}
 
 struct Orbit constr_orbit_from_elements(double semimajor_axis, double eccentricity, double inclination, double raan, double arg_of_peri, double true_anomaly, struct Body *cb) {
 	struct Orbit new_orbit;
@@ -187,43 +201,100 @@ OSV osv_from_orbit(Orbit orbit) {
 	return osv;
 }
 
+// Per-orbit constants of the elliptic fast path. Searches propagate the same few orbits millions of
+// times, so the perifocal rotation and the mean anomaly at the elements' epoch are computed once per
+// distinct set of elements and kept in a small per-thread cache.
+#define ELEMENT_CACHE_SIZE 16
+typedef struct ElementCache {
+	Orbit key;
+	double mean_motion, sq_one_minus_e2, mean_anomaly_at_epoch;
+	double rotation[3][2];	// perifocal (x, y) to the central body's frame; z is always 0
+	int valid;
+} ElementCache;
+
+static _Thread_local ElementCache element_cache[ELEMENT_CACHE_SIZE];
+static _Thread_local int element_cache_next;
+
+static int same_elements(const Orbit *a, const Orbit *b) {
+	return a->a == b->a && a->ta == b->ta && a->e == b->e && a->cb == b->cb && a->i == b->i &&
+		a->raan == b->raan && a->arg_peri == b->arg_peri;
+}
+
+static const ElementCache *elliptic_element_cache(const Orbit *orbit) {
+	for(int k = 0; k < ELEMENT_CACHE_SIZE; k++)
+		if(element_cache[k].valid && same_elements(&element_cache[k].key, orbit)) return &element_cache[k];
+	ElementCache *cache = &element_cache[element_cache_next];
+	element_cache_next = (element_cache_next + 1) % ELEMENT_CACHE_SIZE;
+	double e = orbit->e;
+	double sq_p = sqrt(1 + e), sq_m = sqrt(1 - e);
+	double half_ta_sin, half_ta_cos;
+	orbit_sincos(orbit->ta / 2, &half_ta_sin, &half_ta_cos);
+	double E0 = 2 * atan2(sq_m * half_ta_sin, sq_p * half_ta_cos);
+	double sin_raan, cos_raan, sin_argp, cos_argp, sin_incl, cos_incl;
+	orbit_sincos(orbit->raan, &sin_raan, &cos_raan);
+	orbit_sincos(orbit->arg_peri, &sin_argp, &cos_argp);
+	orbit_sincos(orbit->i, &sin_incl, &cos_incl);
+	cache->key = *orbit;
+	cache->mean_motion = sqrt(orbit->cb->mu / (orbit->a * orbit->a * orbit->a));
+	cache->sq_one_minus_e2 = sq_p * sq_m;
+	cache->mean_anomaly_at_epoch = E0 - e * sin(E0);
+	cache->rotation[0][0] = -sin_raan * cos_incl * sin_argp + cos_raan * cos_argp;
+	cache->rotation[0][1] = -sin_raan * cos_incl * cos_argp - cos_raan * sin_argp;
+	cache->rotation[1][0] =  cos_raan * cos_incl * sin_argp + sin_raan * cos_argp;
+	cache->rotation[1][1] =  cos_raan * cos_incl * cos_argp - sin_raan * sin_argp;
+	cache->rotation[2][0] =  sin_incl * sin_argp;
+	cache->rotation[2][1] =  sin_incl * cos_argp;
+	cache->valid = 1;
+	return cache;
+}
+
+static Vector3 rotate_perifocal(const double rotation[3][2], double x, double y) {
+	Vector3 result = {rotation[0][0] * x + rotation[0][1] * y,
+		rotation[1][0] * x + rotation[1][1] * y,
+		rotation[2][0] * x + rotation[2][1] * y};
+	return result;
+}
+
 OSV osv_from_elements(Orbit orbit, double epoch) {
-	double dt = (epoch - orbit.cb->system->ut0) * (24 * 60 * 60);
-	double e = orbit.e;
-	if(e >= 0 && e < 1 && orbit.a > 0) {
+	return osv_from_elements_after(&orbit, (epoch - orbit.cb->system->ut0) * (24 * 60 * 60));
+}
+
+OSV osv_from_elements_after(const Orbit *orbit, double dt) {
+	double e = orbit->e;
+	if(e >= 0 && e < 1 && orbit->a > 0) {
 		// Fast path: stay in eccentric anomaly and skip the true anomaly round trip.
-		double mu = orbit.cb->mu;
-		double n = sqrt(mu / (orbit.a * orbit.a * orbit.a));
-		double sq_p = sqrt(1 + e), sq_m = sqrt(1 - e);
-		double E0 = 2 * atan2(sq_m * sin(orbit.ta / 2), sq_p * cos(orbit.ta / 2));
-		double M = fmod(E0 - e * sin(E0) + n * dt, 2 * M_PI);
+		const ElementCache *cache = elliptic_element_cache(orbit);
+		double M = fmod(cache->mean_anomaly_at_epoch + cache->mean_motion * dt, 2 * M_PI);
 		if(M < 0) M += 2 * M_PI;
-		double E = e < 0.8 ? M : M_PI;
+		double sinE, cosE;
+		double E;
+		if(e < 0.8) {
+			// One Newton step from M costs one sincos and usually saves two iterations below.
+			orbit_sincos(M, &sinE, &cosE);
+			E = M + e * sinE / (1 - e * cosE);
+		} else E = M_PI;
 		int solved = 0;
-		double sinE = 0, cosE = 1;
 		for(int iteration = 0; iteration < 30; iteration++) {
-			sinE = sin(E); cosE = cos(E);
-			double next_E = E - (E - e * sinE - M) / (1 - e * cosE);
+			orbit_sincos(E, &sinE, &cosE);
+			double delta = (E - e * sinE - M) / (1 - e * cosE);
+			double next_E = E - delta;
 			if(!isfinite(next_E)) break;
-			double change = fabs(next_E - E);
 			E = next_E;
-			if(change < 1e-14) { solved = 1; break; }
+			// Newton converges quadratically, so a step below 1e-8 leaves an error well under 1e-15.
+			if(fabs(delta) < 1e-8) { solved = 1; break; }
 		}
 		if(solved) {
-			sinE = sin(E); cosE = cos(E);
-			double a = orbit.a;
+			orbit_sincos(E, &sinE, &cosE);
+			double a = orbit->a;
 			double r_mag = a * (1 - e * cosE);
-			double sq_mu_a = sqrt(mu * a) / r_mag;
-			double sq_1e2 = sq_p * sq_m;
-			Vector2 r_2d = {a * (cosE - e), a * sq_1e2 * sinE};
-			Vector2 v_2d = {-sq_mu_a * sinE, sq_mu_a * sq_1e2 * cosE};
-			OSV osv = {heliocentric_rot(r_2d, orbit.raan, orbit.arg_peri, orbit.i),
-					heliocentric_rot(v_2d, orbit.raan, orbit.arg_peri, orbit.i)};
+			double sq_mu_a = sqrt(orbit->cb->mu * a) / r_mag;
+			double sq_1e2 = cache->sq_one_minus_e2;
+			OSV osv = {rotate_perifocal(cache->rotation, a * (cosE - e), a * sq_1e2 * sinE),
+					rotate_perifocal(cache->rotation, -sq_mu_a * sinE, sq_mu_a * sq_1e2 * cosE)};
 			return osv;
 		}
 	}
-	orbit = propagate_orbit_time(orbit, dt);
-	return osv_from_orbit(orbit);
+	return osv_from_orbit(propagate_orbit_time(*orbit, dt));
 }
 
 

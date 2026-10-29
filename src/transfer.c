@@ -326,20 +326,24 @@ static int izzo_minimum_time(double lambda, int revolutions, double *x_minimum, 
 	return isfinite(*time_minimum);
 }
 
-Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
-		int revolutions, int right_branch, LambertCancelCheck cancel_check, void *cancel_context) {
-	if(revolutions <= 0)
-		return calc_lambert3_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
-	Lambert3 failure = {.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
-	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
-	if(cb == NULL || !(cb->mu > 0) || !(target_dt > 0) || !isfinite(target_dt)) return failure;
+// Geometry of a multi-revolution Lambert problem shared by its left and right branch.
+typedef struct IzzoRevsProblem {
+	Vector3 r0, r1, radial0, radial1, tangent0, tangent1;
+	double r0_magnitude, r1_magnitude, chord, semiperimeter, lambda, dimensionless_time, x_minimum;
+	Body *cb;
+	int revolutions;
+} IzzoRevsProblem;
+
+// Returns 0 when no solution with this many revolutions exists for the geometry and time.
+static int izzo_revs_problem(Vector3 r0, Vector3 r1, double target_dt, Body *cb, int revolutions, IzzoRevsProblem *problem) {
+	if(cb == NULL || !(cb->mu > 0) || !(target_dt > 0) || !isfinite(target_dt)) return 0;
 	double r0_magnitude = mag_vec3(r0);
 	double r1_magnitude = mag_vec3(r1);
-	if(!(r0_magnitude > 0) || !(r1_magnitude > 0)) return failure;
+	if(!(r0_magnitude > 0) || !(r1_magnitude > 0)) return 0;
 
 	Vector3 direction = cross_vec3(r0, r1);
 	double direction_magnitude = mag_vec3(direction);
-	if(!(direction_magnitude > 0) || !isfinite(direction_magnitude)) return failure;
+	if(!(direction_magnitude > 0) || !isfinite(direction_magnitude)) return 0;
 	direction = scale_vec3(direction, 1 / direction_magnitude);
 
 	Vector3 radial0 = scale_vec3(r0, 1 / r0_magnitude);
@@ -347,7 +351,7 @@ Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt
 	Vector3 tangent0 = cross_vec3(direction, radial0);
 	Vector3 tangent1 = cross_vec3(direction, radial1);
 	double chord = mag_vec3(subtract_vec3(r1, r0));
-	if(!(chord > 0)) return failure;
+	if(!(chord > 0)) return 0;
 	double semiperimeter = (r0_magnitude + r1_magnitude + chord) / 2;
 	double lambda_magnitude = sqrt(fmax(0, 1 - chord / semiperimeter));
 	double lambda = direction.z < 0 ? -lambda_magnitude : lambda_magnitude;
@@ -355,13 +359,26 @@ Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt
 		tangent0 = scale_vec3(tangent0, -1);
 		tangent1 = scale_vec3(tangent1, -1);
 	}
-	double lambda2 = lambda * lambda;
 	double dimensionless_time = sqrt(2 * cb->mu / (semiperimeter * semiperimeter * semiperimeter)) * target_dt;
-	if(!(dimensionless_time > 0) || !isfinite(dimensionless_time)) return failure;
+	if(!(dimensionless_time > 0) || !isfinite(dimensionless_time)) return 0;
+	// Every transfer ellipse has a >= s/2, whose period is pi in these units, so N revolutions need more than N*pi.
+	// The minimum-time search below would reject these too, but only after iterating.
+	if(dimensionless_time < revolutions * M_PI) return 0;
 
 	double x_minimum, time_minimum;
 	if(!izzo_minimum_time(lambda, revolutions, &x_minimum, &time_minimum) ||
-		dimensionless_time < time_minimum) return failure;
+		dimensionless_time < time_minimum) return 0;
+	*problem = (IzzoRevsProblem){r0, r1, radial0, radial1, tangent0, tangent1, r0_magnitude, r1_magnitude,
+		chord, semiperimeter, lambda, dimensionless_time, x_minimum, cb, revolutions};
+	return 1;
+}
+
+static Lambert3 izzo_revs_branch(const IzzoRevsProblem *problem, int right_branch,
+		LambertCancelCheck cancel_check, void *cancel_context) {
+	Lambert3 failure = {.r0 = problem->r0, .r1 = problem->r1, .success = LAMBERT_FAIL_NAN};
+	double lambda = problem->lambda, lambda2 = lambda * lambda;
+	double dimensionless_time = problem->dimensionless_time;
+	int revolutions = problem->revolutions;
 	double x;
 	if(!right_branch) {
 		double a = pow((revolutions * M_PI + M_PI) / (8 * dimensionless_time), 2.0 / 3.0);
@@ -394,22 +411,49 @@ Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt
 		x = next_x;
 	}
 	if(!converged) return failure;
-	if((!right_branch && x > x_minimum + 1e-9) || (right_branch && x < x_minimum - 1e-9)) return failure;
+	if((!right_branch && x > problem->x_minimum + 1e-9) || (right_branch && x < problem->x_minimum - 1e-9)) return failure;
 
 	double y = sqrt(1 - lambda2 * (1 - x * x));
-	double rho = (r0_magnitude - r1_magnitude) / chord;
+	double rho = (problem->r0_magnitude - problem->r1_magnitude) / problem->chord;
 	double sigma = sqrt(fmax(0, 1 - rho * rho));
-	double gamma = sqrt(cb->mu * semiperimeter / 2);
-	double radial_velocity0 = gamma * ((lambda * y - x) - rho * (lambda * y + x)) / r0_magnitude;
-	double radial_velocity1 = -gamma * ((lambda * y - x) + rho * (lambda * y + x)) / r1_magnitude;
+	double gamma = sqrt(problem->cb->mu * problem->semiperimeter / 2);
+	double radial_velocity0 = gamma * ((lambda * y - x) - rho * (lambda * y + x)) / problem->r0_magnitude;
+	double radial_velocity1 = -gamma * ((lambda * y - x) + rho * (lambda * y + x)) / problem->r1_magnitude;
 	double transverse_velocity = gamma * sigma * (y + lambda * x);
-	Vector3 v0 = add_vec3(scale_vec3(radial0, radial_velocity0),
-		scale_vec3(tangent0, transverse_velocity / r0_magnitude));
-	Vector3 v1 = add_vec3(scale_vec3(radial1, radial_velocity1),
-		scale_vec3(tangent1, transverse_velocity / r1_magnitude));
+	Vector3 v0 = add_vec3(scale_vec3(problem->radial0, radial_velocity0),
+		scale_vec3(problem->tangent0, transverse_velocity / problem->r0_magnitude));
+	Vector3 v1 = add_vec3(scale_vec3(problem->radial1, radial_velocity1),
+		scale_vec3(problem->tangent1, transverse_velocity / problem->r1_magnitude));
 	if(!isfinite(v0.x) || !isfinite(v0.y) || !isfinite(v0.z) ||
 		!isfinite(v1.x) || !isfinite(v1.y) || !isfinite(v1.z)) return failure;
-	return (Lambert3){r0, v0, r1, v1, LAMBERT_SUCCESS};
+	return (Lambert3){problem->r0, v0, problem->r1, v1, LAMBERT_SUCCESS};
+}
+
+Lambert3 calc_lambert3_revs_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
+		int revolutions, int right_branch, LambertCancelCheck cancel_check, void *cancel_context) {
+	if(revolutions <= 0)
+		return calc_lambert3_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
+	Lambert3 failure = {.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
+	if(cancel_check != NULL && cancel_check(cancel_context)) return failure;
+	IzzoRevsProblem problem;
+	if(!izzo_revs_problem(r0, r1, target_dt, cb, revolutions, &problem)) return failure;
+	return izzo_revs_branch(&problem, right_branch, cancel_check, cancel_context);
+}
+
+void calc_lambert3_revs_pair_cancellable(Vector3 r0, Vector3 r1, double target_dt, Body *cb, int revolutions,
+		Lambert3 *left_branch, Lambert3 *right_branch, LambertCancelCheck cancel_check, void *cancel_context) {
+	Lambert3 failure = {.r0 = r0, .r1 = r1, .success = LAMBERT_FAIL_NAN};
+	*left_branch = failure;
+	*right_branch = failure;
+	if(revolutions <= 0) {
+		*left_branch = calc_lambert3_cancellable(r0, r1, target_dt, cb, cancel_check, cancel_context);
+		return;
+	}
+	if(cancel_check != NULL && cancel_check(cancel_context)) return;
+	IzzoRevsProblem problem;
+	if(!izzo_revs_problem(r0, r1, target_dt, cb, revolutions, &problem)) return;
+	*left_branch = izzo_revs_branch(&problem, 0, cancel_check, cancel_context);
+	*right_branch = izzo_revs_branch(&problem, 1, cancel_check, cancel_context);
 }
 
 Lambert3 calc_lambert3_revs(Vector3 r0, Vector3 r1, double target_dt, Body *cb,
@@ -424,28 +468,43 @@ double get_flyby_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *b
 	return (1 / cos(beta) - 1) * (body->mu / (pow(mag_vec3(v1), 2)));
 }
 
+// Everything in a powered flyby that does not depend on the periapsis radius.
+typedef struct PoweredFlybyGeometry {
+	Vector3 incoming_direction, outgoing_direction, normal;
+	double incoming_speed, outgoing_speed, direction_dot, denominator, mu;
+	int valid;
+} PoweredFlybyGeometry;
+
+static PoweredFlybyGeometry powered_flyby_geometry(Vector3 incoming, Vector3 outgoing,
+		double incoming_speed, double outgoing_speed, double mu) {
+	PoweredFlybyGeometry geometry = {.incoming_speed = incoming_speed, .outgoing_speed = outgoing_speed, .mu = mu};
+	geometry.incoming_direction = scale_vec3(incoming, 1 / incoming_speed);
+	geometry.outgoing_direction = scale_vec3(outgoing, 1 / outgoing_speed);
+	geometry.direction_dot = fmax(-1, fmin(1, dot_vec3(geometry.incoming_direction, geometry.outgoing_direction)));
+	geometry.denominator = 1 - geometry.direction_dot * geometry.direction_dot;
+	if(geometry.denominator < 1e-12) return geometry;
+	Vector3 normal = cross_vec3(geometry.incoming_direction, geometry.outgoing_direction);
+	double normal_magnitude = mag_vec3(normal);
+	if(!(normal_magnitude > 0)) return geometry;
+	geometry.normal = scale_vec3(normal, 1 / normal_magnitude);
+	geometry.valid = 1;
+	return geometry;
+}
+
 // only_side is -1 or +1 to fix the side of the plane of the two excess velocities, 0 for the cheaper one.
-static int powered_flyby_at_radius_side(Vector3 incoming, Vector3 outgoing, double incoming_speed,
-		double outgoing_speed, double mu, double periapsis_radius, int only_side, PoweredFlybyResult *result) {
-	Vector3 incoming_direction = scale_vec3(incoming, 1 / incoming_speed);
-	Vector3 outgoing_direction = scale_vec3(outgoing, 1 / outgoing_speed);
-	double direction_dot = fmax(-1, fmin(1, dot_vec3(incoming_direction, outgoing_direction)));
-	double denominator = 1 - direction_dot * direction_dot;
-	if(denominator < 1e-12) return 0;
+static int powered_flyby_at_radius_side(const PoweredFlybyGeometry *geometry, double periapsis_radius,
+		int only_side, PoweredFlybyResult *result) {
+	if(!geometry->valid) return 0;
+	double incoming_speed = geometry->incoming_speed, outgoing_speed = geometry->outgoing_speed;
+	double mu = geometry->mu, direction_dot = geometry->direction_dot;
 	double incoming_sine = 1 / (1 + periapsis_radius * incoming_speed * incoming_speed / mu);
 	double outgoing_sine = 1 / (1 + periapsis_radius * outgoing_speed * outgoing_speed / mu);
-	double incoming_cosine = sqrt(fmax(0, 1 - incoming_sine * incoming_sine));
-	double outgoing_cosine = sqrt(fmax(0, 1 - outgoing_sine * outgoing_sine));
-	double incoming_scale = (incoming_sine + direction_dot * outgoing_sine) / denominator;
-	double outgoing_scale = (-outgoing_sine - direction_dot * incoming_sine) / denominator;
-	Vector3 periapsis_planar = add_vec3(scale_vec3(incoming_direction, incoming_scale),
-		scale_vec3(outgoing_direction, outgoing_scale));
+	double incoming_scale = (incoming_sine + direction_dot * outgoing_sine) / geometry->denominator;
+	double outgoing_scale = (-outgoing_sine - direction_dot * incoming_sine) / geometry->denominator;
+	Vector3 periapsis_planar = add_vec3(scale_vec3(geometry->incoming_direction, incoming_scale),
+		scale_vec3(geometry->outgoing_direction, outgoing_scale));
 	double planar_norm_squared = dot_vec3(periapsis_planar, periapsis_planar);
 	if(planar_norm_squared > 1 + 1e-10) return 0;
-	Vector3 normal = cross_vec3(incoming_direction, outgoing_direction);
-	double normal_magnitude = mag_vec3(normal);
-	if(!(normal_magnitude > 0)) return 0;
-	normal = scale_vec3(normal, 1 / normal_magnitude);
 	double normal_component = sqrt(fmax(0, 1 - planar_norm_squared));
 	double incoming_periapsis_speed = sqrt(incoming_speed * incoming_speed + 2 * mu / periapsis_radius);
 	double outgoing_periapsis_speed = sqrt(outgoing_speed * outgoing_speed + 2 * mu / periapsis_radius);
@@ -453,10 +512,10 @@ static int powered_flyby_at_radius_side(Vector3 incoming, Vector3 outgoing, doub
 	for(int side = -1; side <= 1; side += 2) {
 		if(only_side != 0 && side != only_side) continue;
 		Vector3 periapsis_direction = add_vec3(periapsis_planar,
-			scale_vec3(normal, side * normal_component));
-		Vector3 incoming_tangent = norm_vec3(subtract_vec3(incoming_direction,
+			scale_vec3(geometry->normal, side * normal_component));
+		Vector3 incoming_tangent = norm_vec3(subtract_vec3(geometry->incoming_direction,
 			scale_vec3(periapsis_direction, incoming_sine)));
-		Vector3 outgoing_tangent = norm_vec3(add_vec3(outgoing_direction,
+		Vector3 outgoing_tangent = norm_vec3(add_vec3(geometry->outgoing_direction,
 			scale_vec3(periapsis_direction, outgoing_sine)));
 		Vector3 incoming_velocity = scale_vec3(incoming_tangent, incoming_periapsis_speed);
 		Vector3 outgoing_velocity = scale_vec3(outgoing_tangent, outgoing_periapsis_speed);
@@ -475,10 +534,64 @@ static int powered_flyby_at_radius_side(Vector3 incoming, Vector3 outgoing, doub
 	return 1;
 }
 
-static int powered_flyby_at_radius(Vector3 incoming, Vector3 outgoing, double incoming_speed,
-		double outgoing_speed, double mu, double periapsis_radius, PoweredFlybyResult *result) {
-	return powered_flyby_at_radius_side(incoming, outgoing, incoming_speed, outgoing_speed, mu,
-		periapsis_radius, 0, result);
+static int powered_flyby_at_radius(const PoweredFlybyGeometry *geometry, double periapsis_radius,
+		PoweredFlybyResult *result) {
+	return powered_flyby_at_radius_side(geometry, periapsis_radius, 0, result);
+}
+
+// Burn magnitude of powered_flyby_at_radius without building the result; DBL_MAX when infeasible. The two sides of
+// the excess-velocity plane are mirror images with the same burn, so one side is enough for the radius search.
+static double powered_flyby_burn_at_radius(const PoweredFlybyGeometry *geometry, double periapsis_radius) {
+	if(!geometry->valid) return DBL_MAX;
+	double incoming_speed = geometry->incoming_speed, outgoing_speed = geometry->outgoing_speed;
+	double mu = geometry->mu, direction_dot = geometry->direction_dot;
+	double incoming_sine = 1 / (1 + periapsis_radius * incoming_speed * incoming_speed / mu);
+	double outgoing_sine = 1 / (1 + periapsis_radius * outgoing_speed * outgoing_speed / mu);
+	double incoming_scale = (incoming_sine + direction_dot * outgoing_sine) / geometry->denominator;
+	double outgoing_scale = (-outgoing_sine - direction_dot * incoming_sine) / geometry->denominator;
+	Vector3 periapsis_planar = add_vec3(scale_vec3(geometry->incoming_direction, incoming_scale),
+		scale_vec3(geometry->outgoing_direction, outgoing_scale));
+	double planar_norm_squared = dot_vec3(periapsis_planar, periapsis_planar);
+	if(planar_norm_squared > 1 + 1e-10) return DBL_MAX;
+	double normal_component = sqrt(fmax(0, 1 - planar_norm_squared));
+	double incoming_periapsis_speed = sqrt(incoming_speed * incoming_speed + 2 * mu / periapsis_radius);
+	double outgoing_periapsis_speed = sqrt(outgoing_speed * outgoing_speed + 2 * mu / periapsis_radius);
+	Vector3 periapsis_direction = add_vec3(periapsis_planar, scale_vec3(geometry->normal, -normal_component));
+	Vector3 incoming_tangent = norm_vec3(subtract_vec3(geometry->incoming_direction,
+		scale_vec3(periapsis_direction, incoming_sine)));
+	Vector3 outgoing_tangent = norm_vec3(add_vec3(geometry->outgoing_direction,
+		scale_vec3(periapsis_direction, outgoing_sine)));
+	double burn = mag_vec3(subtract_vec3(scale_vec3(outgoing_tangent, outgoing_periapsis_speed),
+		scale_vec3(incoming_tangent, incoming_periapsis_speed)));
+	return isfinite(burn) ? burn : DBL_MAX;
+}
+
+// Log-spaced periapsis grid of calculate_powered_flyby. The bounds depend only on the body, so the
+// radii are reused across calls; per thread.
+#define POWERED_FLYBY_GRID_SAMPLES 64
+#define POWERED_FLYBY_GRID_CACHE_SIZE 8
+typedef struct PoweredFlybyGrid {
+	double minimum_radius, maximum_radius;
+	double radii[POWERED_FLYBY_GRID_SAMPLES];
+	int valid;
+} PoweredFlybyGrid;
+
+static _Thread_local PoweredFlybyGrid powered_flyby_grids[POWERED_FLYBY_GRID_CACHE_SIZE];
+static _Thread_local int powered_flyby_grid_next;
+
+static const double *powered_flyby_grid(double minimum_radius, double maximum_radius, double log_minimum, double log_range) {
+	for(int k = 0; k < POWERED_FLYBY_GRID_CACHE_SIZE; k++) {
+		if(powered_flyby_grids[k].valid && powered_flyby_grids[k].minimum_radius == minimum_radius &&
+			powered_flyby_grids[k].maximum_radius == maximum_radius) return powered_flyby_grids[k].radii;
+	}
+	PoweredFlybyGrid *grid = &powered_flyby_grids[powered_flyby_grid_next];
+	powered_flyby_grid_next = (powered_flyby_grid_next + 1) % POWERED_FLYBY_GRID_CACHE_SIZE;
+	grid->minimum_radius = minimum_radius;
+	grid->maximum_radius = maximum_radius;
+	for(int sample = 0; sample < POWERED_FLYBY_GRID_SAMPLES; sample++)
+		grid->radii[sample] = exp(log_minimum + log_range * sample / (POWERED_FLYBY_GRID_SAMPLES - 1));
+	grid->valid = 1;
+	return grid->radii;
 }
 
 static int powered_flyby_soi_state(Body *body, Vector3 periapsis_direction,
@@ -528,6 +641,7 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	double incoming_speed = mag_vec3(incoming);
 	double outgoing_speed = mag_vec3(outgoing);
 	if(!(incoming_speed > 0) || !(outgoing_speed > 0)) return 0;
+	PoweredFlybyGeometry geometry = powered_flyby_geometry(incoming, outgoing, incoming_speed, outgoing_speed, body->mu);
 	PoweredFlybyResult shortcut;
 	int shortcut_valid = 0;
 	if(fabs(incoming_speed - outgoing_speed) < 1) {
@@ -535,8 +649,7 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 		// so it is only returned directly when the burn is negligible.
 		double unpowered_periapsis = get_flyby_periapsis(v_arr, v_dep, v_body, body);
 		if(unpowered_periapsis < minimum_periapsis_radius) return 0;
-		shortcut_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, unpowered_periapsis, &shortcut) &&
+		shortcut_valid = powered_flyby_at_radius(&geometry, unpowered_periapsis, &shortcut) &&
 			populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &shortcut);
 		if(shortcut_valid && shortcut.burn_delta_v < 2.0) {
 			*result = shortcut;
@@ -553,17 +666,18 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	if(!(maximum_periapsis > minimum_periapsis_radius)) return 0;
 
 	int found_solution = 0;
-	const int sample_count = 64;
+	const int sample_count = POWERED_FLYBY_GRID_SAMPLES;
 	double log_minimum = log(minimum_periapsis_radius);
 	double log_range = log(maximum_periapsis / minimum_periapsis_radius);
+	const double *grid_radii = powered_flyby_grid(minimum_periapsis_radius, maximum_periapsis, log_minimum, log_range);
 	double lower = 0, upper = 0;
-	PoweredFlybyResult best = {.burn_delta_v = DBL_MAX};
+	// The radius search only needs burn magnitudes; the full result is built once at the chosen radius.
+	double best_burn = DBL_MAX, best_radius = 0;
 	for(int sample = 0; sample < sample_count; sample++) {
-		double periapsis_radius = exp(log_minimum + log_range * sample / (sample_count - 1));
-		PoweredFlybyResult candidate;
-		if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, periapsis_radius, &candidate) && candidate.burn_delta_v < best.burn_delta_v) {
-			best = candidate;
+		double burn = powered_flyby_burn_at_radius(&geometry, grid_radii[sample]);
+		if(burn < best_burn) {
+			best_burn = burn;
+			best_radius = grid_radii[sample];
 			lower = log_minimum + log_range * fmax(0, sample - 1) / (sample_count - 1);
 			upper = log_minimum + log_range * fmin(sample_count - 1, sample + 1) / (sample_count - 1);
 			found_solution = 1;
@@ -573,21 +687,23 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 	double local_lower = 0, local_upper = 0, local_best_burn = DBL_MAX;
 	int local_found = 0;
 	double turn_periapsis = get_flyby_periapsis(v_arr, v_dep, v_body, body);
-	if(isfinite(turn_periapsis) && turn_periapsis > 0 && best.burn_delta_v > 5.0) {
+	if(isfinite(turn_periapsis) && turn_periapsis > 0 && best_burn > 5.0) {
 		const int local_count = 49;
 		double local_span = log(2.0);
 		for(int sample = 0; sample < local_count; sample++) {
 			double log_radius = log(turn_periapsis) + local_span * (2.0 * sample / (local_count - 1) - 1);
 			double periapsis_radius = exp(log_radius);
 			if(periapsis_radius < minimum_periapsis_radius || periapsis_radius > maximum_periapsis) continue;
-			PoweredFlybyResult candidate;
-			if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-				body->mu, periapsis_radius, &candidate) && candidate.burn_delta_v < local_best_burn) {
-				local_best_burn = candidate.burn_delta_v;
+			double burn = powered_flyby_burn_at_radius(&geometry, periapsis_radius);
+			if(burn < local_best_burn) {
+				local_best_burn = burn;
 				double step = 2 * local_span / (local_count - 1);
 				local_lower = log_radius - step;
 				local_upper = log_radius + step;
-				if(candidate.burn_delta_v < best.burn_delta_v) best = candidate;
+				if(burn < best_burn) {
+					best_burn = burn;
+					best_radius = periapsis_radius;
+				}
 				found_solution = 1;
 				local_found = 1;
 			}
@@ -607,37 +723,37 @@ int calculate_powered_flyby(Vector3 v_arr, Vector3 v_dep, Vector3 v_body, Body *
 		}
 		double first_log = lower + (upper - lower) * 0.3819660112501051;
 		double second_log = lower + (upper - lower) * 0.6180339887498949;
-		PoweredFlybyResult first, second;
-		int first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, exp(first_log), &first);
-		int second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, exp(second_log), &second);
-		double first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
-		double second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
+		double first_cost = powered_flyby_burn_at_radius(&geometry, exp(first_log));
+		double second_cost = powered_flyby_burn_at_radius(&geometry, exp(second_log));
 		// Golden-section search: each step keeps one interior point, so only one new radius is evaluated.
+		// The minimum is V-shaped where the burn nears zero, so the bracket must shrink to roundoff.
 		for(int iteration = 0; iteration < 32; iteration++) {
 			if(first_cost <= second_cost) {
 				upper = second_log;
 				second_log = first_log;
 				second_cost = first_cost;
 				first_log = lower + (upper - lower) * 0.3819660112501051;
-				first_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-					body->mu, exp(first_log), &first);
-				first_cost = first_valid ? first.burn_delta_v : DBL_MAX;
+				first_cost = powered_flyby_burn_at_radius(&geometry, exp(first_log));
 			} else {
 				lower = first_log;
 				first_log = second_log;
 				first_cost = second_cost;
 				second_log = lower + (upper - lower) * 0.6180339887498949;
-				second_valid = powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-					body->mu, exp(second_log), &second);
-				second_cost = second_valid ? second.burn_delta_v : DBL_MAX;
+				second_cost = powered_flyby_burn_at_radius(&geometry, exp(second_log));
 			}
 		}
-		PoweredFlybyResult refined;
-		if(powered_flyby_at_radius(incoming, outgoing, incoming_speed, outgoing_speed,
-			body->mu, exp((lower + upper) / 2), &refined) && refined.burn_delta_v < best.burn_delta_v)
-			best = refined;
+		double refined_radius = exp((lower + upper) / 2);
+		double refined_burn = powered_flyby_burn_at_radius(&geometry, refined_radius);
+		if(refined_burn < best_burn) {
+			best_burn = refined_burn;
+			best_radius = refined_radius;
+		}
+	}
+	PoweredFlybyResult best;
+	if(!powered_flyby_at_radius(&geometry, best_radius, &best)) {
+		if(!shortcut_valid) return 0;
+		*result = shortcut;
+		return 1;
 	}
 	int best_valid = populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, &best);
 	if(shortcut_valid && (!best_valid || shortcut.burn_delta_v <= best.burn_delta_v)) {
@@ -657,8 +773,8 @@ int calculate_powered_flyby_at_periapsis(Vector3 v_arr, Vector3 v_dep, Vector3 v
 	double incoming_speed = mag_vec3(incoming);
 	double outgoing_speed = mag_vec3(outgoing);
 	if(!(incoming_speed > 0) || !(outgoing_speed > 0)) return 0;
-	return powered_flyby_at_radius_side(incoming, outgoing, incoming_speed, outgoing_speed,
-		body->mu, periapsis_radius, side, result) &&
+	PoweredFlybyGeometry geometry = powered_flyby_geometry(incoming, outgoing, incoming_speed, outgoing_speed, body->mu);
+	return powered_flyby_at_radius_side(&geometry, periapsis_radius, side, result) &&
 		populate_powered_flyby_soi(body, incoming_speed, outgoing_speed, result);
 }
 

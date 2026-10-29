@@ -186,6 +186,18 @@ OSV osv_from_orbit(Orbit orbit);
  */
 OSV osv_from_elements(Orbit orbit, double epoch);
 
+/**
+ * @brief Constructs an orbital state vector dt seconds after the state described by the orbital elements
+ *
+ * Elliptic orbits use a cached eccentric-anomaly propagation; other orbits fall back to
+ * propagate_orbit_time. osv_from_elements uses this with dt measured from the system epoch.
+ *
+ * @param orbit Orbit struct containing orbital elements
+ * @param dt Time after the elements' epoch [s]
+ * @return Orbital state vector (OSV) with position and velocity
+ */
+OSV osv_from_elements_after(const Orbit *orbit, double dt);
+
 /*
  * ------------------------------------
  * Orbit Propagation
